@@ -3,6 +3,7 @@ from typing import Optional
 
 import hydra
 import pytorch_lightning as pl
+import torch
 from nuplan.planning.script.builders.folder_builder import (
     build_training_experiment_folder,
 )
@@ -32,6 +33,9 @@ def main(cfg: DictConfig) -> Optional[TrainingEngine]:
     Main entrypoint for training/validation experiments.
     :param cfg: omegaconf dictionary
     """
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+
     pl.seed_everything(cfg.seed, workers=True)
 
     # Configure logger

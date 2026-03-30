@@ -173,7 +173,6 @@ class NATLayer(nn.Module):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
-            attn_drop=attn_drop,
             proj_drop=drop,
         )
 
