@@ -1,0 +1,17 @@
+# @package _global_
+job_name: planTF_ssl_pretrain
+py_func: train
+objective_aggregate_mode: mean
+
+defaults:
+  - override /data_augmentation: null
+  - override /splitter: nuplan
+  - override /model: planTF_ssl_input
+  - override /scenario_filter: training_scenarios_1M
+  - override /custom_trainer: planTF
+  - override /lightning: custom_lightning
+
+lightning:
+  trainer:
+    params:
+      strategy: ddp_find_unused_parameters_true

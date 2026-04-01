@@ -30,6 +30,12 @@ class LightningTrainer(pl.LightningModule):
         weight_decay,
         epochs,
         warmup_epochs,
+        print_ssl_losses: bool = False,
+        ssl_loss_print_interval: int = 50,
+        plot_debug_batches: bool = False,
+        debug_plot_dir: str = "debug/ssl_train_plots",
+        debug_plot_interval: int = 100,
+        debug_plot_max_batches: int = 10,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -39,8 +45,35 @@ class LightningTrainer(pl.LightningModule):
         self.weight_decay = weight_decay
         self.epochs = epochs
         self.warmup_epochs = warmup_epochs
+        self.print_ssl_losses = print_ssl_losses
+        self.ssl_loss_print_interval = ssl_loss_print_interval
+        self.plot_debug_batches = plot_debug_batches
+        self.debug_plot_dir = debug_plot_dir
+        self.debug_plot_interval = debug_plot_interval
+        self.debug_plot_max_batches = debug_plot_max_batches
+        self._debug_plot_count = 0
+
+    def _get_feature_data(self, features: FeaturesType):
+        feature_builders = self.model.get_list_of_required_feature()
+        if len(feature_builders) != 1:
+            raise KeyError(
+                f"Expected exactly one feature builder, got {len(feature_builders)}."
+            )
+
+        feature_key = feature_builders[0].get_feature_unique_name()
+        if feature_key not in features:
+            available = ", ".join(sorted(features.keys()))
+            raise KeyError(
+                f"Missing feature key `{feature_key}` in batch. Available keys: {available}"
+            )
+
+        return features[feature_key].data
 
     def on_fit_start(self) -> None:
+        if getattr(self.model, "pretrain_ssl", False):
+            self.metrics = {}
+            return
+
         metrics_collection = MetricCollection(
             {
                 "minADE1": minADE(k=1).to(self.device),
@@ -59,15 +92,113 @@ class LightningTrainer(pl.LightningModule):
         self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], prefix: str
     ) -> torch.Tensor:
         features, _, _ = batch
-        res = self.forward(features["feature"].data)
+        feature_data = self._get_feature_data(features)
+        self._last_feature_data = feature_data
+        res = self.forward(feature_data)
 
-        losses = self._compute_objectives(res, features["feature"].data)
-        metrics = self._compute_metrics(res, features["feature"].data, prefix)
+        losses = self._compute_objectives(res, feature_data)
+        metrics = self._compute_metrics(res, feature_data, prefix)
         self._log_step(losses["loss"], losses, metrics, prefix)
 
         return losses["loss"]
 
+    @staticmethod
+    def _masked_regression_loss(
+        prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        if not mask.any():
+            return prediction.new_zeros(())
+        return F.smooth_l1_loss(prediction[mask], target[mask])
+
+    @staticmethod
+    def _masked_bce_loss(
+        prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        if not mask.any():
+            return prediction.new_zeros(())
+        return F.binary_cross_entropy_with_logits(prediction[mask], target[mask])
+
     def _compute_objectives(self, res, data) -> Dict[str, torch.Tensor]:
+        if getattr(self.model, "pretrain_ssl", False):
+            if "ssl" not in data:
+                raise KeyError(
+                    "Missing `data['ssl']` for SSL pretraining. This usually means "
+                    "the run loaded cached features from the plain NuplanFeatureBuilder "
+                    "instead of SSLNuplanFeatureBuilder. Rebuild the cache with the SSL "
+                    "config, or use a separate cache path / disable cache-only mode."
+                )
+            ssl_pred = res["ssl"]
+            ssl_target = data["ssl"]
+
+            agent_target = torch.cat(
+                [
+                    ssl_target["agent_position_gt"],
+                    torch.stack(
+                        [
+                            ssl_target["agent_heading_gt"].cos(),
+                            ssl_target["agent_heading_gt"].sin(),
+                        ],
+                        dim=-1,
+                    ),
+                    ssl_target["agent_velocity_gt"],
+                    ssl_target["agent_shape_gt"],
+                ],
+                dim=-1,
+            )
+            map_target = torch.cat(
+                [
+                    ssl_target["map_point_position_gt"],
+                    ssl_target["map_point_vector_gt"],
+                    torch.stack(
+                        [
+                            ssl_target["map_point_orientation_gt"].cos(),
+                            ssl_target["map_point_orientation_gt"].sin(),
+                        ],
+                        dim=-1,
+                    ),
+                ],
+                dim=-1,
+            )
+            route_target = ssl_target["route_gt"].float()
+            ego_target = agent_target[:, 0]
+            agent_target = agent_target[:, 1:]
+
+            ego_ssl_loss = self._masked_regression_loss(
+                ssl_pred["ego_reconstruction"],
+                ego_target,
+                ssl_target["agent_hist_mask"][:, 0],
+            )
+            agent_ssl_loss = self._masked_regression_loss(
+                ssl_pred["agent_reconstruction"],
+                agent_target,
+                ssl_target["agent_hist_mask"][:, 1:],
+            )
+            map_ssl_loss = self._masked_regression_loss(
+                ssl_pred["map_reconstruction"],
+                map_target,
+                ssl_target["map_point_mask"],
+            )
+            route_ssl_loss = self._masked_bce_loss(
+                ssl_pred["route_logits"],
+                route_target,
+                ssl_target["route_mask"],
+            )
+
+            loss = (
+                self.model.ssl_ego_weight * ego_ssl_loss
+                + self.model.ssl_agent_weight * agent_ssl_loss
+                + self.model.ssl_map_weight * map_ssl_loss
+                + self.model.ssl_route_weight * route_ssl_loss
+            )
+
+            return {
+                "loss": loss,
+                "ego_ssl_loss": ego_ssl_loss,
+                "agent_ssl_loss": agent_ssl_loss,
+                "map_ssl_loss": map_ssl_loss,
+                "route_ssl_loss": route_ssl_loss,
+            }
+
         trajectory, probability, prediction = (
             res["trajectory"],
             res["probability"],
@@ -108,6 +239,8 @@ class LightningTrainer(pl.LightningModule):
         }
 
     def _compute_metrics(self, output, data, prefix) -> Dict[str, torch.Tensor]:
+        if getattr(self.model, "pretrain_ssl", False):
+            return None
         metrics = self.metrics[prefix](output, data["agent"]["target"][:, 0])
         return metrics
 
@@ -136,6 +269,30 @@ class LightningTrainer(pl.LightningModule):
                 sync_dist=True,
             )
 
+        if (
+            getattr(self.model, "pretrain_ssl", False)
+            and self.print_ssl_losses
+            and prefix == "train"
+            and self.global_rank == 0
+            and self.global_step % max(1, self.ssl_loss_print_interval) == 0
+        ):
+            printable = []
+            for key, value in objectives.items():
+                if torch.is_tensor(value):
+                    printable.append(f"{key}={value.detach().item():.6f}")
+            self.print(
+                f"[ssl train step {self.global_step}] " + ", ".join(printable)
+            )
+
+        if (
+            getattr(self.model, "pretrain_ssl", False)
+            and self.plot_debug_batches
+            and prefix == "train"
+            and self.global_rank == 0
+            and self.global_step % max(1, self.debug_plot_interval) == 0
+        ):
+            self._plot_debug_batch(prefix)
+
         if metrics is not None:
             self.log_dict(
                 metrics,
@@ -145,6 +302,92 @@ class LightningTrainer(pl.LightningModule):
                 batch_size=1,
                 sync_dist=True,
             )
+
+    def _plot_debug_batch(self, prefix: str) -> None:
+        data = getattr(self, "_last_feature_data", None)
+        if data is None or "ssl" not in data:
+            return
+
+        ssl_data = data["ssl"]
+        required = [
+            "debug_raw_agent_position",
+            "debug_raw_agent_valid_mask",
+            "debug_raw_map_point_position",
+            "debug_raw_map_valid_mask",
+            "debug_raw_polygon_on_route",
+        ]
+        if any(key not in ssl_data for key in required):
+            return
+
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+
+        os.makedirs(self.debug_plot_dir, exist_ok=True)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+        self._draw_scene(
+            axes[0],
+            ssl_data["debug_raw_agent_position"][0].detach().cpu(),
+            ssl_data["debug_raw_agent_valid_mask"][0].detach().cpu(),
+            ssl_data["debug_raw_map_point_position"][0].detach().cpu(),
+            ssl_data["debug_raw_map_valid_mask"][0].detach().cpu(),
+            ssl_data["debug_raw_polygon_on_route"][0].detach().cpu(),
+            "Original Input",
+        )
+        self._draw_scene(
+            axes[1],
+            data["agent"]["position"][0, :, : self.model.history_steps].detach().cpu(),
+            data["agent"]["valid_mask"][0, :, : self.model.history_steps]
+            .detach()
+            .cpu(),
+            data["map"]["point_position"][0, :, 0].detach().cpu(),
+            data["map"]["valid_mask"][0].detach().cpu(),
+            data["map"]["polygon_on_route"][0].detach().cpu(),
+            "Masked Input",
+        )
+        fig.tight_layout()
+        filename = os.path.join(
+            self.debug_plot_dir,
+            f"{prefix}_ssl_step_{self.global_step:06d}_{self._debug_plot_count:04d}.png",
+        )
+        fig.savefig(filename, dpi=150)
+        plt.close(fig)
+        self._debug_plot_count += 1
+
+    @staticmethod
+    def _draw_scene(
+        ax,
+        agent_position: torch.Tensor,
+        agent_valid_mask: torch.Tensor,
+        map_point_position: torch.Tensor,
+        map_valid_mask: torch.Tensor,
+        polygon_on_route: torch.Tensor,
+        title: str,
+    ) -> None:
+        for lane_idx in range(map_point_position.shape[0]):
+            valid_points = map_valid_mask[lane_idx].bool()
+            if not valid_points.any():
+                continue
+            lane_points = map_point_position[lane_idx, valid_points]
+            color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
+            ax.plot(lane_points[:, 0], lane_points[:, 1], color=color, linewidth=1.0)
+
+        for agent_idx in range(agent_position.shape[0]):
+            valid_steps = agent_valid_mask[agent_idx].bool()
+            if not valid_steps.any():
+                continue
+            traj = agent_position[agent_idx, valid_steps]
+            color = "tab:red" if agent_idx == 0 else "tab:blue"
+            ax.plot(traj[:, 0], traj[:, 1], color=color, linewidth=1.5, alpha=0.9)
+            ax.scatter(traj[-1, 0], traj[-1, 1], color=color, s=12)
+
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, linewidth=0.3, alpha=0.4)
 
     def training_step(
         self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], batch_idx: int

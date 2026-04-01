@@ -17,16 +17,24 @@ from src.utils.conversion import to_device, to_numpy, to_tensor
 class NuplanFeature(AbstractModelFeature):
     data: Dict[str, Any]
 
+    @staticmethod
+    def _pad_nested_tensors(feature_list: List["NuplanFeature"], key: str) -> Dict[str, Any]:
+        return {
+            nested_key: pad_sequence(
+                [f.data[key][nested_key] for f in feature_list], batch_first=True
+            )
+            for nested_key in feature_list[0].data[key].keys()
+        }
+
     @classmethod
     def collate(cls, feature_list: List[NuplanFeature]) -> NuplanFeature:
         batch_data = {}
         for key in ["agent", "map"]:
-            batch_data[key] = {
-                k: pad_sequence(
-                    [f.data[key][k] for f in feature_list], batch_first=True
-                )
-                for k in feature_list[0].data[key].keys()
-            }
+            batch_data[key] = cls._pad_nested_tensors(feature_list, key)
+
+        if "ssl" in feature_list[0].data:
+            batch_data["ssl"] = cls._pad_nested_tensors(feature_list, "ssl")
+
         for key in ["current_state", "origin", "angle"]:
             batch_data[key] = torch.stack([f.data[key] for f in feature_list], dim=0)
 

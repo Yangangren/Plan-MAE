@@ -188,7 +188,7 @@ def build_custom_trainer(cfg: DictConfig) -> pl.Trainer:
     callbacks = [
         ModelCheckpoint(
             dirpath=os.path.join(os.getcwd(), "checkpoints"),
-            filename="{epoch}-{val_minFDE:.3f}",
+            filename="{epoch}-{step}",
             monitor=cfg.lightning.trainer.checkpoint.monitor,
             mode=cfg.lightning.trainer.checkpoint.mode,
             save_top_k=cfg.lightning.trainer.checkpoint.save_top_k,

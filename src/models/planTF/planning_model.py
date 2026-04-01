@@ -34,6 +34,12 @@ class PlanningModel(TorchModuleWrapper):
         use_ego_history=False,
         state_attn_encoder=True,
         state_dropout=0.75,
+        pretrain_ssl: bool = False,
+        map_point_steps: int = 20,
+        ssl_agent_weight: float = 1.0,
+        ssl_ego_weight: float = 1.0,
+        ssl_map_weight: float = 1.0,
+        ssl_route_weight: float = 0.5,
         feature_builder: NuplanFeatureBuilder = NuplanFeatureBuilder(),
     ) -> None:
         super().__init__(
@@ -45,6 +51,12 @@ class PlanningModel(TorchModuleWrapper):
         self.dim = dim
         self.history_steps = history_steps
         self.future_steps = future_steps
+        self.pretrain_ssl = pretrain_ssl
+        self.map_point_steps = map_point_steps
+        self.ssl_agent_weight = ssl_agent_weight
+        self.ssl_ego_weight = ssl_ego_weight
+        self.ssl_map_weight = ssl_map_weight
+        self.ssl_route_weight = ssl_route_weight
 
         self.pos_emb = build_mlp(4, [dim] * 2)
         self.agent_encoder = AgentEncoder(
@@ -76,6 +88,14 @@ class PlanningModel(TorchModuleWrapper):
             out_channels=4,
         )
         self.agent_predictor = build_mlp(dim, [dim * 2, future_steps * 2], norm="ln")
+        self.agent_ssl_decoder = build_mlp(
+            dim, [dim * 2, history_steps * 8], norm="ln"
+        )
+        self.ego_ssl_decoder = build_mlp(dim, [dim * 2, history_steps * 8], norm="ln")
+        self.map_ssl_decoder = build_mlp(
+            dim, [dim * 2, map_point_steps * 6], norm="ln"
+        )
+        self.route_ssl_decoder = build_mlp(dim, [dim, 1], norm="ln")
 
         self.apply(self._init_weights)
 
@@ -94,6 +114,7 @@ class PlanningModel(TorchModuleWrapper):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, data):
+        # NOTE: the position embedding utilizes unmasked inputs
         agent_pos = data["agent"]["position"][:, :, self.history_steps - 1]
         agent_heading = data["agent"]["heading"][:, :, self.history_steps - 1]
         agent_mask = data["agent"]["valid_mask"][:, :, : self.history_steps]
@@ -121,6 +142,24 @@ class PlanningModel(TorchModuleWrapper):
         for blk in self.encoder_blocks:
             x = blk(x, key_padding_mask=key_padding_mask)
         x = self.norm(x)
+
+        x_agent_ctx = x[:, :A]
+        x_polygon_ctx = x[:, A:]
+
+        if self.pretrain_ssl:
+            ssl_out = {
+                "ego_reconstruction": self.ego_ssl_decoder(x_agent_ctx[:, 0]).view(
+                    bs, self.history_steps, 8
+                ),
+                "agent_reconstruction": self.agent_ssl_decoder(x_agent_ctx[:, 1:]).view(
+                    bs, A - 1, self.history_steps, 8
+                ),
+                "map_reconstruction": self.map_ssl_decoder(x_polygon_ctx).view(
+                    bs, -1, self.map_point_steps, 6
+                ),
+                "route_logits": self.route_ssl_decoder(x_polygon_ctx).squeeze(-1),
+            }
+            return {"ssl": ssl_out}
 
         trajectory, probability = self.trajectory_decoder(x[:, 0])
         prediction = self.agent_predictor(x[:, 1:A]).view(bs, -1, self.future_steps, 2)

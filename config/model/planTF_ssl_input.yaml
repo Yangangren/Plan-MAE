@@ -1,0 +1,37 @@
+_target_: src.models.planTF.planning_model.PlanningModel
+_convert_: "all"
+
+dim: 128
+state_channel: 6
+polygon_channel: 6
+history_channel: 9
+history_steps: 21
+future_steps: 80
+encoder_depth: 4
+drop_path: 0.2
+num_heads: 8
+num_modes: 6
+state_dropout: 0.75
+use_ego_history: false
+state_attn_encoder: true
+pretrain_ssl: true
+map_point_steps: 20
+ssl_agent_weight: 1.0
+ssl_ego_weight: 1.0
+ssl_map_weight: 1.0
+ssl_route_weight: 0.5
+
+feature_builder:
+  _target_: src.feature_builders.ssl_nuplan_feature_builder.SSLNuplanFeatureBuilder
+  _convert_: "all"
+  radius: 100
+  history_horizon: 2
+  future_horizon: 8
+  sample_interval: 0.1
+  max_agents: 32
+  agent_history_mask_ratio: 0.3
+  map_mask_ratio: 0.3
+  route_mask_ratio: 0.3
+  mask_ego_history: true
+  min_agent_history: 4
+  min_map_points: 4
