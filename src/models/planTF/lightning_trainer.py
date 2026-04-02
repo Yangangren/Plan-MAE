@@ -310,11 +310,11 @@ class LightningTrainer(pl.LightningModule):
 
         ssl_data = data["ssl"]
         required = [
-            "debug_raw_agent_position",
-            "debug_raw_agent_valid_mask",
-            "debug_raw_map_point_position",
-            "debug_raw_map_valid_mask",
-            "debug_raw_polygon_on_route",
+            "raw_agent_position",
+            "raw_agent_valid_mask",
+            "raw_map_point_position",
+            "raw_map_valid_mask",
+            "raw_polygon_on_route",
         ]
         if any(key not in ssl_data for key in required):
             return
@@ -328,38 +328,52 @@ class LightningTrainer(pl.LightningModule):
             return
 
         os.makedirs(self.debug_plot_dir, exist_ok=True)
-        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-        self._draw_scene(
-            axes[0],
-            ssl_data["debug_raw_agent_position"][0].detach().cpu(),
-            ssl_data["debug_raw_agent_valid_mask"][0].detach().cpu(),
-            ssl_data["debug_raw_map_point_position"][0].detach().cpu(),
-            ssl_data["debug_raw_map_valid_mask"][0].detach().cpu(),
-            ssl_data["debug_raw_polygon_on_route"][0].detach().cpu(),
-            "Original Input",
-        )
-        self._draw_scene(
-            axes[1],
-            data["agent"]["position"][0, :, : self.model.history_steps].detach().cpu(),
-            data["agent"]["valid_mask"][0, :, : self.model.history_steps]
-            .detach()
-            .cpu(),
-            data["map"]["point_position"][0, :, 0].detach().cpu(),
-            data["map"]["valid_mask"][0].detach().cpu(),
-            data["map"]["polygon_on_route"][0].detach().cpu(),
-            "Masked Input",
-        )
-        fig.tight_layout()
-        filename = os.path.join(
-            self.debug_plot_dir,
-            f"{prefix}_ssl_step_{self.global_step:06d}_{self._debug_plot_count:04d}.png",
-        )
-        fig.savefig(filename, dpi=150)
-        plt.close(fig)
-        self._debug_plot_count += 1
+        batch_size = data["agent"]["position"].shape[0]
+
+        for sample_idx in range(batch_size):
+            fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+            self._draw_original_scene(
+                axes[0],
+                ssl_data["raw_agent_position"][sample_idx].detach().cpu(),
+                ssl_data["raw_agent_valid_mask"][sample_idx].detach().cpu(),
+                ssl_data["raw_map_point_position"][sample_idx].detach().cpu(),
+                ssl_data["raw_map_valid_mask"][sample_idx].detach().cpu(),
+                ssl_data["raw_polygon_on_route"][sample_idx].detach().cpu(),
+                "Original Input",
+            )
+            self._draw_masked_scene(
+                axes[1],
+                data["agent"]["position"][sample_idx, :, : self.model.history_steps]
+                .detach()
+                .cpu(),
+                data["agent"]["valid_mask"][sample_idx, :, : self.model.history_steps]
+                .detach()
+                .cpu(),
+                data["map"]["point_position"][sample_idx, :, 0].detach().cpu(),
+                data["map"]["valid_mask"][sample_idx].detach().cpu(),
+                data["map"]["polygon_on_route"][sample_idx].detach().cpu(),
+                ssl_data["agent_position_gt"][sample_idx].detach().cpu(),
+                ssl_data["agent_hist_mask"][sample_idx].detach().cpu(),
+                ssl_data["map_point_position_gt"][sample_idx].detach().cpu(),
+                ssl_data["map_point_mask"][sample_idx].detach().cpu(),
+                ssl_data["route_gt"][sample_idx].detach().cpu(),
+                ssl_data["route_mask"][sample_idx].detach().cpu(),
+                "Masked Input",
+            )
+            fig.tight_layout()
+            filename = os.path.join(
+                self.debug_plot_dir,
+                (
+                    f"{prefix}_ssl_step_{self.global_step:06d}_"
+                    f"plot_{self._debug_plot_count:04d}_sample_{sample_idx:02d}.png"
+                ),
+            )
+            fig.savefig(filename, dpi=150)
+            plt.close(fig)
+            self._debug_plot_count += 1
 
     @staticmethod
-    def _draw_scene(
+    def _draw_original_scene(
         ax,
         agent_position: torch.Tensor,
         agent_valid_mask: torch.Tensor,
@@ -374,7 +388,9 @@ class LightningTrainer(pl.LightningModule):
                 continue
             lane_points = map_point_position[lane_idx, valid_points]
             color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
-            ax.plot(lane_points[:, 0], lane_points[:, 1], color=color, linewidth=1.0)
+            zorder = 1 if polygon_on_route[lane_idx] > 0 else 0
+            ax.scatter(lane_points[:, 0], lane_points[:, 1], color=color, 
+                       s=8, alpha=0.9, zorder=zorder)
 
         for agent_idx in range(agent_position.shape[0]):
             valid_steps = agent_valid_mask[agent_idx].bool()
@@ -382,12 +398,94 @@ class LightningTrainer(pl.LightningModule):
                 continue
             traj = agent_position[agent_idx, valid_steps]
             color = "tab:red" if agent_idx == 0 else "tab:blue"
-            ax.plot(traj[:, 0], traj[:, 1], color=color, linewidth=1.5, alpha=0.9)
-            ax.scatter(traj[-1, 0], traj[-1, 1], color=color, s=12)
+            zorder = 10 if agent_idx == 0 else 5
+            ax.scatter(traj[:, 0], traj[:, 1], color=color, s=12, alpha=0.9, zorder=zorder)
+            ax.scatter(traj[-1, 0], traj[-1, 1], color=color, s=24, edgecolors="black", zorder=zorder)
 
         ax.set_title(title)
         ax.set_aspect("equal", adjustable="box")
         ax.grid(True, linewidth=0.3, alpha=0.4)
+        ax.set_xlim([-30, 70])
+        ax.set_ylim([-40, 40])
+
+    @staticmethod
+    def _draw_masked_scene(
+        ax,
+        agent_position: torch.Tensor,
+        agent_valid_mask: torch.Tensor,
+        map_point_position: torch.Tensor,
+        map_valid_mask: torch.Tensor,
+        polygon_on_route: torch.Tensor,
+        agent_position_gt: torch.Tensor,
+        agent_hist_mask: torch.Tensor,
+        map_point_position_gt: torch.Tensor,
+        map_point_mask: torch.Tensor,
+        route_gt: torch.Tensor,
+        route_mask: torch.Tensor,
+        title: str,
+    ) -> None:
+        for lane_idx in range(map_point_position.shape[0]):
+            visible_points = map_valid_mask[lane_idx].bool()
+            masked_points = map_point_mask[lane_idx].bool()
+
+            if visible_points.any():
+                lane_points = map_point_position[lane_idx, visible_points]
+                color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
+                ax.scatter(
+                    lane_points[:, 0], lane_points[:, 1], color=color, s=8, alpha=0.9
+                )
+
+            if masked_points.any():
+                masked_lane_points = map_point_position_gt[lane_idx, masked_points]
+                masked_color = "gold" if route_gt[lane_idx] > 0 else "magenta"
+                marker = "x" if route_mask[lane_idx] else "o"
+                ax.scatter(
+                    masked_lane_points[:, 0],
+                    masked_lane_points[:, 1],
+                    color=masked_color,
+                    s=18,
+                    alpha=0.95,
+                    marker=marker,
+                )
+
+        for agent_idx in range(agent_position.shape[0]):
+            visible_steps = agent_valid_mask[agent_idx].bool()
+            masked_steps = agent_hist_mask[agent_idx].bool()
+
+            if visible_steps.any():
+                traj = agent_position[agent_idx, visible_steps]
+                color = "tab:red" if agent_idx == 0 else "tab:blue"
+                ax.scatter(traj[:, 0], traj[:, 1], color=color, s=12, alpha=0.9)
+                ax.scatter(
+                    traj[-1, 0], traj[-1, 1], color=color, s=24, edgecolors="black"
+                )
+                if not masked_steps.any():
+                    ax.text(
+                        traj[-1, 0] + 0.8,
+                        traj[-1, 1] + 0.8,
+                        "F",
+                        color="black",
+                        fontsize=9,
+                        fontweight="bold",
+                    )
+
+            if masked_steps.any():
+                masked_traj = agent_position_gt[agent_idx, masked_steps]
+                masked_color = "limegreen" if agent_idx == 0 else "cyan"
+                ax.scatter(
+                    masked_traj[:, 0],
+                    masked_traj[:, 1],
+                    color=masked_color,
+                    s=20,
+                    alpha=0.95,
+                    marker="x",
+                )
+
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, linewidth=0.3, alpha=0.4)
+        ax.set_xlim([-30, 70])
+        ax.set_ylim([-40, 40])
 
     def training_step(
         self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], batch_idx: int

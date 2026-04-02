@@ -33,5 +33,10 @@ feature_builder:
   map_mask_ratio: 0.3
   route_mask_ratio: 0.3
   mask_ego_history: true
-  min_agent_history: 4
-  min_map_points: 4
+  min_agent_history: 10
+  min_map_points: 10
+  min_agent_path_length: 10.0
+  min_agent_speed: 2.0
+  agent_x_min: -30.0
+  agent_x_max: 70.0
+  max_agent_distance: 80.0

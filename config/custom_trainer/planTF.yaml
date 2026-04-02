@@ -3,5 +3,5 @@ print_ssl_losses: false
 ssl_loss_print_interval: 20
 plot_debug_batches: false
 debug_plot_dir: debug/ssl_train_plots
-debug_plot_interval: 100
+debug_plot_interval: 1
 debug_plot_max_batches: 10
