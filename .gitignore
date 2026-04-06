@@ -7,6 +7,7 @@ __pycache__/
 *.so
 .codex
 **/*.png
+debug/
 
 # Distribution / packaging
 .Python

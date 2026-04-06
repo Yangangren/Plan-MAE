@@ -89,11 +89,11 @@ class PlanningModel(TorchModuleWrapper):
         )
         self.agent_predictor = build_mlp(dim, [dim * 2, future_steps * 2], norm="ln")
         self.agent_ssl_decoder = build_mlp(
-            dim, [dim * 2, history_steps * 8], norm="ln"
+            dim, [dim * 2, history_steps * 2], norm="ln"
         )
-        self.ego_ssl_decoder = build_mlp(dim, [dim * 2, history_steps * 8], norm="ln")
+        self.ego_ssl_decoder = build_mlp(dim, [dim * 2, history_steps * 2], norm="ln")
         self.map_ssl_decoder = build_mlp(
-            dim, [dim * 2, map_point_steps * 6], norm="ln"
+            dim, [dim * 2, map_point_steps * 2], norm="ln"
         )
         self.route_ssl_decoder = build_mlp(dim, [dim, 1], norm="ln")
 
@@ -149,13 +149,13 @@ class PlanningModel(TorchModuleWrapper):
         if self.pretrain_ssl:
             ssl_out = {
                 "ego_reconstruction": self.ego_ssl_decoder(x_agent_ctx[:, 0]).view(
-                    bs, self.history_steps, 8
+                    bs, self.history_steps, 2
                 ),
                 "agent_reconstruction": self.agent_ssl_decoder(x_agent_ctx[:, 1:]).view(
-                    bs, A - 1, self.history_steps, 8
+                    bs, A - 1, self.history_steps, 2
                 ),
                 "map_reconstruction": self.map_ssl_decoder(x_polygon_ctx).view(
-                    bs, -1, self.map_point_steps, 6
+                    bs, -1, self.map_point_steps, 2
                 ),
                 "route_logits": self.route_ssl_decoder(x_polygon_ctx).squeeze(-1),
             }

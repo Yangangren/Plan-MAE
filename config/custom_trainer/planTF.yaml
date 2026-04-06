@@ -5,3 +5,6 @@ plot_debug_batches: false
 debug_plot_dir: debug/ssl_train_plots
 debug_plot_interval: 1
 debug_plot_max_batches: 10
+plot_test_reconstructions: false
+test_plot_dir: debug/ssl_test_plots
+test_summary_path: ssl_test_metrics.json

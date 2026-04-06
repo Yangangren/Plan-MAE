@@ -106,6 +106,12 @@ class SSLNuplanFeatureBuilder(NuplanFeatureBuilder):
         velocity_gt[history_mask] = velocity_history[history_mask]
         shape_gt[history_mask] = shape_history[history_mask]
 
+        # Remain ego history gt
+        position_gt[0] = position_history[0]
+        heading_gt[0] = heading_history[0]
+        velocity_gt[0] = velocity_history[0]
+        shape_gt[0] = shape_history[0]
+
         # In place mutation of raw data
         position_history[history_mask] = 0.0
         heading_history[history_mask] = 0.0

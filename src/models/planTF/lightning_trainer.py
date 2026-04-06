@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from typing import Dict, Tuple, Union
@@ -36,6 +37,9 @@ class LightningTrainer(pl.LightningModule):
         debug_plot_dir: str = "debug/ssl_train_plots",
         debug_plot_interval: int = 100,
         debug_plot_max_batches: int = 10,
+        plot_test_reconstructions: bool = False,
+        test_plot_dir: str = "debug/ssl_test_plots",
+        test_summary_path: str = "ssl_test_metrics.json",
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -51,7 +55,12 @@ class LightningTrainer(pl.LightningModule):
         self.debug_plot_dir = debug_plot_dir
         self.debug_plot_interval = debug_plot_interval
         self.debug_plot_max_batches = debug_plot_max_batches
+        self.plot_test_reconstructions = plot_test_reconstructions
+        self.test_plot_dir = test_plot_dir
+        self.test_summary_path = test_summary_path
         self._debug_plot_count = 0
+        self._test_plot_count = 0
+        self._ssl_test_stats = None
 
     def _get_feature_data(self, features: FeaturesType):
         feature_builders = self.model.get_list_of_required_feature()
@@ -88,6 +97,26 @@ class LightningTrainer(pl.LightningModule):
             "val": metrics_collection.clone(prefix="val/"),
         }
 
+    def on_test_start(self) -> None:
+        if not getattr(self.model, "pretrain_ssl", False):
+            return
+
+        self._test_plot_count = 0
+        self._ssl_test_stats = {
+            "ego_abs_sum": 0.0,
+            "ego_sq_sum": 0.0,
+            "ego_count": 0,
+            "agent_abs_sum": 0.0,
+            "agent_sq_sum": 0.0,
+            "agent_count": 0,
+            "map_abs_sum": 0.0,
+            "map_sq_sum": 0.0,
+            "map_count": 0,
+            "route_bce_sum": 0.0,
+            "route_correct": 0,
+            "route_count": 0,
+        }
+
     def _step(
         self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], prefix: str
     ) -> torch.Tensor:
@@ -95,6 +124,7 @@ class LightningTrainer(pl.LightningModule):
         feature_data = self._get_feature_data(features)
         self._last_feature_data = feature_data
         res = self.forward(feature_data)
+        self._last_forward_output = res
 
         losses = self._compute_objectives(res, feature_data)
         metrics = self._compute_metrics(res, feature_data, prefix)
@@ -130,43 +160,17 @@ class LightningTrainer(pl.LightningModule):
             ssl_pred = res["ssl"]
             ssl_target = data["ssl"]
 
-            agent_target = torch.cat(
-                [
-                    ssl_target["agent_position_gt"],
-                    torch.stack(
-                        [
-                            ssl_target["agent_heading_gt"].cos(),
-                            ssl_target["agent_heading_gt"].sin(),
-                        ],
-                        dim=-1,
-                    ),
-                    ssl_target["agent_velocity_gt"],
-                    ssl_target["agent_shape_gt"],
-                ],
-                dim=-1,
-            )
-            map_target = torch.cat(
-                [
-                    ssl_target["map_point_position_gt"],
-                    ssl_target["map_point_vector_gt"],
-                    torch.stack(
-                        [
-                            ssl_target["map_point_orientation_gt"].cos(),
-                            ssl_target["map_point_orientation_gt"].sin(),
-                        ],
-                        dim=-1,
-                    ),
-                ],
-                dim=-1,
-            )
+            agent_target = ssl_target["agent_position_gt"]
+            map_target = ssl_target["map_point_position_gt"]
             route_target = ssl_target["route_gt"].float()
             ego_target = agent_target[:, 0]
             agent_target = agent_target[:, 1:]
-
+            # NOTE: Ego history trajectory is not served as ssl inputs,
+            # and must be non-zero loss for ego
             ego_ssl_loss = self._masked_regression_loss(
-                ssl_pred["ego_reconstruction"],
-                ego_target,
-                ssl_target["agent_hist_mask"][:, 0],
+                ssl_pred["ego_reconstruction"][:, :-1, :],
+                ego_target[:, :-1, :],
+                ssl_target["raw_agent_valid_mask"][:, 0, :-1],
             )
             agent_ssl_loss = self._masked_regression_loss(
                 ssl_pred["agent_reconstruction"],
@@ -243,6 +247,88 @@ class LightningTrainer(pl.LightningModule):
             return None
         metrics = self.metrics[prefix](output, data["agent"]["target"][:, 0])
         return metrics
+
+    def _accumulate_masked_position_stats(
+        self, prefix: str, prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    ) -> None:
+        if self._ssl_test_stats is None or not mask.any():
+            return
+
+        pred_masked = prediction[mask]
+        target_masked = target[mask]
+        diff = pred_masked - target_masked
+        self._ssl_test_stats[f"{prefix}_abs_sum"] += diff.abs().sum().detach().item()
+        self._ssl_test_stats[f"{prefix}_sq_sum"] += (diff ** 2).sum().detach().item()
+        self._ssl_test_stats[f"{prefix}_count"] += diff.numel()
+
+    def _update_ssl_test_stats(self, res, data) -> None:
+        if self._ssl_test_stats is None:
+            return
+
+        ssl_pred = res["ssl"]
+        ssl_target = data["ssl"]
+
+        ego_pred = ssl_pred["ego_reconstruction"][:, :-1, :]
+        ego_gt = ssl_target["agent_position_gt"][:, 0, :-1, :]
+        ego_mask = ssl_target["raw_agent_valid_mask"][:, 0, :-1]
+
+        agent_pred = ssl_pred["agent_reconstruction"]
+        agent_gt = ssl_target["agent_position_gt"][:, 1:, :, :]
+        agent_mask = ssl_target["agent_hist_mask"][:, 1:]
+
+        map_pred = ssl_pred["map_reconstruction"]
+        map_gt = ssl_target["map_point_position_gt"]
+        map_mask = ssl_target["map_point_mask"]
+
+        route_logits = ssl_pred["route_logits"]
+        route_gt = ssl_target["route_gt"].float()
+        route_mask = ssl_target["route_mask"]
+
+        self._accumulate_masked_position_stats("ego", ego_pred, ego_gt, ego_mask)
+        self._accumulate_masked_position_stats("agent", agent_pred, agent_gt, agent_mask)
+        self._accumulate_masked_position_stats("map", map_pred, map_gt, map_mask)
+
+        if route_mask.any():
+            bce = F.binary_cross_entropy_with_logits(
+                route_logits[route_mask], route_gt[route_mask], reduction="sum"
+            )
+            route_pred = (torch.sigmoid(route_logits[route_mask]) > 0.5).long()
+            route_true = route_gt[route_mask].long()
+            self._ssl_test_stats["route_bce_sum"] += bce.detach().item()
+            self._ssl_test_stats["route_correct"] += (
+                (route_pred == route_true).sum().detach().item()
+            )
+            self._ssl_test_stats["route_count"] += route_true.numel()
+
+    def on_test_epoch_end(self) -> None:
+        if not getattr(self.model, "pretrain_ssl", False) or self._ssl_test_stats is None:
+            return
+
+        summary = {}
+        for prefix in ["ego", "agent", "map"]:
+            count = max(1, self._ssl_test_stats[f"{prefix}_count"])
+            summary[f"{prefix}_mae_xy"] = self._ssl_test_stats[f"{prefix}_abs_sum"] / count
+            summary[f"{prefix}_rmse_xy"] = (
+                self._ssl_test_stats[f"{prefix}_sq_sum"] / count
+            ) ** 0.5
+            summary[f"{prefix}_count"] = self._ssl_test_stats[f"{prefix}_count"]
+
+        route_count = max(1, self._ssl_test_stats["route_count"])
+        summary["route_bce"] = self._ssl_test_stats["route_bce_sum"] / route_count
+        summary["route_accuracy"] = (
+            self._ssl_test_stats["route_correct"] / route_count
+        )
+        summary["route_count"] = self._ssl_test_stats["route_count"]
+
+        if self.global_rank == 0:
+            self.print("[ssl test summary] " + json.dumps(summary))
+            summary_path = (
+                self.test_summary_path
+                if os.path.isabs(self.test_summary_path)
+                else os.path.join(os.getcwd(), self.test_summary_path)
+            )
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
 
     def _log_step(
         self,
@@ -372,6 +458,87 @@ class LightningTrainer(pl.LightningModule):
             plt.close(fig)
             self._debug_plot_count += 1
 
+    def _plot_test_reconstruction_batch(self) -> None:
+        data = getattr(self, "_last_feature_data", None)
+        res = getattr(self, "_last_forward_output", None)
+        if data is None or res is None or "ssl" not in data or "ssl" not in res:
+            return
+
+        ssl_data = data["ssl"]
+        ssl_pred = res["ssl"]
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+
+        os.makedirs(self.test_plot_dir, exist_ok=True)
+        batch_size = data["agent"]["position"].shape[0]
+
+        for sample_idx in range(batch_size):
+            fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+            self._draw_original_scene(
+                axes[0],
+                ssl_data["raw_agent_position"][sample_idx].detach().cpu(),
+                ssl_data["raw_agent_valid_mask"][sample_idx].detach().cpu(),
+                ssl_data["raw_map_point_position"][sample_idx].detach().cpu(),
+                ssl_data["raw_map_valid_mask"][sample_idx].detach().cpu(),
+                ssl_data["raw_polygon_on_route"][sample_idx].detach().cpu(),
+                "Original Input",
+            )
+            self._draw_masked_scene(
+                axes[1],
+                data["agent"]["position"][sample_idx, :, : self.model.history_steps]
+                .detach()
+                .cpu(),
+                data["agent"]["valid_mask"][sample_idx, :, : self.model.history_steps]
+                .detach()
+                .cpu(),
+                data["map"]["point_position"][sample_idx, :, 0].detach().cpu(),
+                data["map"]["valid_mask"][sample_idx].detach().cpu(),
+                data["map"]["polygon_on_route"][sample_idx].detach().cpu(),
+                ssl_data["agent_position_gt"][sample_idx].detach().cpu(),
+                ssl_data["agent_hist_mask"][sample_idx].detach().cpu(),
+                ssl_data["map_point_position_gt"][sample_idx].detach().cpu(),
+                ssl_data["map_point_mask"][sample_idx].detach().cpu(),
+                ssl_data["route_gt"][sample_idx].detach().cpu(),
+                ssl_data["route_mask"][sample_idx].detach().cpu(),
+                "Masked Input",
+            )
+            self._draw_reconstruction_scene(
+                axes[2],
+                data["agent"]["position"][sample_idx, :, : self.model.history_steps]
+                .detach()
+                .cpu(),
+                data["agent"]["valid_mask"][sample_idx, :, : self.model.history_steps]
+                .detach()
+                .cpu(),
+                data["map"]["point_position"][sample_idx, :, 0].detach().cpu(),
+                data["map"]["valid_mask"][sample_idx].detach().cpu(),
+                data["map"]["polygon_on_route"][sample_idx].detach().cpu(),
+                ssl_pred["ego_reconstruction"][sample_idx].detach().cpu(),
+                ssl_pred["agent_reconstruction"][sample_idx].detach().cpu(),
+                ssl_pred["map_reconstruction"][sample_idx].detach().cpu(),
+                ssl_pred["route_logits"][sample_idx].detach().cpu(),
+                ssl_data["agent_position_gt"][sample_idx].detach().cpu(),
+                ssl_data["agent_hist_mask"][sample_idx].detach().cpu(),
+                ssl_data["map_point_position_gt"][sample_idx].detach().cpu(),
+                ssl_data["map_point_mask"][sample_idx].detach().cpu(),
+                ssl_data["route_gt"][sample_idx].detach().cpu(),
+                ssl_data["route_mask"][sample_idx].detach().cpu(),
+                "Reconstruction",
+            )
+            fig.tight_layout()
+            filename = os.path.join(
+                self.test_plot_dir,
+                f"test_ssl_plot_{self._test_plot_count:04d}_sample_{sample_idx:02d}.png",
+            )
+            fig.savefig(filename, dpi=150)
+            plt.close(fig)
+            self._test_plot_count += 1
+
     @staticmethod
     def _draw_original_scene(
         ax,
@@ -389,8 +556,14 @@ class LightningTrainer(pl.LightningModule):
             lane_points = map_point_position[lane_idx, valid_points]
             color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
             zorder = 1 if polygon_on_route[lane_idx] > 0 else 0
-            ax.scatter(lane_points[:, 0], lane_points[:, 1], color=color, 
-                       s=8, alpha=0.9, zorder=zorder)
+            ax.scatter(
+                lane_points[:, 0],
+                lane_points[:, 1],
+                color=color,
+                s=8,
+                alpha=0.9,
+                zorder=zorder,
+            )
 
         for agent_idx in range(agent_position.shape[0]):
             valid_steps = agent_valid_mask[agent_idx].bool()
@@ -399,8 +572,17 @@ class LightningTrainer(pl.LightningModule):
             traj = agent_position[agent_idx, valid_steps]
             color = "tab:red" if agent_idx == 0 else "tab:blue"
             zorder = 10 if agent_idx == 0 else 5
-            ax.scatter(traj[:, 0], traj[:, 1], color=color, s=12, alpha=0.9, zorder=zorder)
-            ax.scatter(traj[-1, 0], traj[-1, 1], color=color, s=24, edgecolors="black", zorder=zorder)
+            ax.scatter(
+                traj[:, 0], traj[:, 1], color=color, s=12, alpha=0.9, zorder=zorder
+            )
+            ax.scatter(
+                traj[-1, 0],
+                traj[-1, 1],
+                color=color,
+                s=24,
+                edgecolors="black",
+                zorder=zorder,
+            )
 
         ax.set_title(title)
         ax.set_aspect("equal", adjustable="box")
@@ -487,6 +669,81 @@ class LightningTrainer(pl.LightningModule):
         ax.set_xlim([-30, 70])
         ax.set_ylim([-40, 40])
 
+    @staticmethod
+    def _draw_reconstruction_scene(
+        ax,
+        agent_position: torch.Tensor,
+        agent_valid_mask: torch.Tensor,
+        map_point_position: torch.Tensor,
+        map_valid_mask: torch.Tensor,
+        polygon_on_route: torch.Tensor,
+        ego_pred: torch.Tensor,
+        agent_pred: torch.Tensor,
+        map_pred: torch.Tensor,
+        route_logits: torch.Tensor,
+        agent_position_gt: torch.Tensor,
+        agent_hist_mask: torch.Tensor,
+        map_point_position_gt: torch.Tensor,
+        map_point_mask: torch.Tensor,
+        route_gt: torch.Tensor,
+        route_mask: torch.Tensor,
+        title: str,
+    ) -> None:
+        for lane_idx in range(map_point_position.shape[0]):
+            visible_points = map_valid_mask[lane_idx].bool()
+            masked_points = map_point_mask[lane_idx].bool()
+            route_pred = torch.sigmoid(route_logits[lane_idx]) > 0.5
+
+            if visible_points.any():
+                lane_points = map_point_position[lane_idx, visible_points]
+                color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
+                ax.scatter(
+                    lane_points[:, 0], lane_points[:, 1], color=color, s=8, alpha=0.6
+                )
+
+            if masked_points.any():
+                pred_points = map_pred[lane_idx, masked_points]
+                gt_points = map_point_position_gt[lane_idx, masked_points]
+                pred_color = "darkorange" if route_pred else "purple"
+                gt_color = "gold" if route_gt[lane_idx] > 0 else "magenta"
+                ax.scatter(
+                    gt_points[:, 0], gt_points[:, 1], color=gt_color, s=22, marker="x"
+                )
+                ax.scatter(
+                    pred_points[:, 0], pred_points[:, 1], color=pred_color, s=16, marker="^"
+                )
+
+        for agent_idx in range(agent_position.shape[0]):
+            visible_steps = agent_valid_mask[agent_idx].bool()
+            masked_steps = agent_hist_mask[agent_idx].bool()
+
+            if visible_steps.any():
+                traj = agent_position[agent_idx, visible_steps]
+                color = "tab:red" if agent_idx == 0 else "tab:blue"
+                ax.scatter(traj[:, 0], traj[:, 1], color=color, s=10, alpha=0.6)
+
+            if masked_steps.any():
+                gt_traj = agent_position_gt[agent_idx, masked_steps]
+                if agent_idx == 0:
+                    pred_traj = ego_pred[:-1, :][masked_steps[:-1]]
+                    pred_color = "darkgreen"
+                    gt_color = "limegreen"
+                else:
+                    pred_traj = agent_pred[agent_idx - 1, masked_steps]
+                    pred_color = "navy"
+                    gt_color = "cyan"
+                ax.scatter(gt_traj[:, 0], gt_traj[:, 1], color=gt_color, s=22, marker="x")
+                if pred_traj.numel() > 0:
+                    ax.scatter(
+                        pred_traj[:, 0], pred_traj[:, 1], color=pred_color, s=16, marker="^"
+                    )
+
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, linewidth=0.3, alpha=0.4)
+        ax.set_xlim([-30, 70])
+        ax.set_ylim([-40, 40])
+
     def training_step(
         self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], batch_idx: int
     ) -> torch.Tensor:
@@ -514,14 +771,24 @@ class LightningTrainer(pl.LightningModule):
     def test_step(
         self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], batch_idx: int
     ) -> torch.Tensor:
-        """
-        Step called for each batch example during testing.
+        features, _, _ = batch
+        feature_data = self._get_feature_data(features)
+        self._last_feature_data = feature_data
+        res = self.forward(feature_data)
+        self._last_forward_output = res
 
-        :param batch: example batch
-        :param batch_idx: batch's index (unused)
-        :return: model's loss tensor
-        """
-        return self._step(batch, "test")
+        losses = self._compute_objectives(res, feature_data)
+        self._update_ssl_test_stats(res, feature_data)
+        self._log_step(losses["loss"], losses, None, "test")
+
+        if (
+            getattr(self.model, "pretrain_ssl", False)
+            and self.plot_test_reconstructions
+            and self.global_rank == 0
+        ):
+            self._plot_test_reconstruction_batch()
+
+        return losses["loss"]
 
     def forward(self, features: FeaturesType) -> TargetsType:
         """
