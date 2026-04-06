@@ -2,7 +2,8 @@ CUDA_VISIBLE_DEVICES=0 python run_training.py \
   py_func=train +training=train_planTF_ssl_pretrain \
   worker=single_machine_thread_pool worker.max_workers=8 \
   scenario_builder=nuplan scenario_filter=mini \
-  cache.cache_path=/home/ryan/nuplan/exp/cache_mini_ssl cache.use_cache_without_dataset=true cache.force_feature_computation=false \
+  scenario_builder.db_files=$HOME/nuplan/data/nuplan-v1.1/splits/mini \
+  cache.cache_path=/home/ryan/nuplan/exp/cache_mini_ssl cache.use_cache_without_dataset=false cache.force_feature_computation=true \
   data_loader.params.batch_size=4 data_loader.params.num_workers=8 \
   lr=1e-3 epochs=25 warmup_epochs=3 weight_decay=0.0001 \
   lightning.trainer.params.val_check_interval=1.0 \

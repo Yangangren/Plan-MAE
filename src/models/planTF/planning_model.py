@@ -73,6 +73,7 @@ class PlanningModel(TorchModuleWrapper):
         self.map_encoder = MapEncoder(
             dim=dim,
             polygon_channel=polygon_channel,
+            pretrain_ssl=pretrain_ssl
         )
 
         self.encoder_blocks = nn.ModuleList(

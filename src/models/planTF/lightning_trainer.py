@@ -377,7 +377,7 @@ class LightningTrainer(pl.LightningModule):
             and self.global_rank == 0
             and self.global_step % max(1, self.debug_plot_interval) == 0
         ):
-            self._plot_debug_batch(prefix)
+            self._plot_train_batch(prefix)
 
         if metrics is not None:
             self.log_dict(
@@ -389,7 +389,7 @@ class LightningTrainer(pl.LightningModule):
                 sync_dist=True,
             )
 
-    def _plot_debug_batch(self, prefix: str) -> None:
+    def _plot_train_batch(self, prefix: str) -> None:
         data = getattr(self, "_last_feature_data", None)
         if data is None or "ssl" not in data:
             return
@@ -425,6 +425,8 @@ class LightningTrainer(pl.LightningModule):
                 ssl_data["raw_map_point_position"][sample_idx].detach().cpu(),
                 ssl_data["raw_map_valid_mask"][sample_idx].detach().cpu(),
                 ssl_data["raw_polygon_on_route"][sample_idx].detach().cpu(),
+                ssl_data["raw_polygon_center"][sample_idx].detach().cpu(),
+                ssl_data["raw_polygon_position"][sample_idx].detach().cpu(),
                 "Original Input",
             )
             self._draw_masked_scene(
@@ -444,6 +446,8 @@ class LightningTrainer(pl.LightningModule):
                 ssl_data["map_point_mask"][sample_idx].detach().cpu(),
                 ssl_data["route_gt"][sample_idx].detach().cpu(),
                 ssl_data["route_mask"][sample_idx].detach().cpu(),
+                ssl_data["raw_polygon_center"][sample_idx].detach().cpu(),
+                ssl_data["raw_polygon_position"][sample_idx].detach().cpu(),
                 "Masked Input",
             )
             fig.tight_layout()
@@ -486,7 +490,7 @@ class LightningTrainer(pl.LightningModule):
                 ssl_data["raw_map_point_position"][sample_idx].detach().cpu(),
                 ssl_data["raw_map_valid_mask"][sample_idx].detach().cpu(),
                 ssl_data["raw_polygon_on_route"][sample_idx].detach().cpu(),
-                "Original Input",
+                title="Original Input",
             )
             self._draw_masked_scene(
                 axes[1],
@@ -547,15 +551,29 @@ class LightningTrainer(pl.LightningModule):
         map_point_position: torch.Tensor,
         map_valid_mask: torch.Tensor,
         polygon_on_route: torch.Tensor,
-        title: str,
+        polygon_center: torch.Tensor=None,
+        polygon_position: torch.Tensor=None,
+        title: str='',
     ) -> None:
         for lane_idx in range(map_point_position.shape[0]):
             valid_points = map_valid_mask[lane_idx].bool()
             if not valid_points.any():
                 continue
             lane_points = map_point_position[lane_idx, valid_points]
-            color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
-            zorder = 1 if polygon_on_route[lane_idx] > 0 else 0
+
+            color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "gray"
+            linewidth = 2.5 if polygon_on_route[lane_idx] > 0 else 1.0
+            zorder = 2 if polygon_on_route[lane_idx] > 0 else 1
+
+            ax.plot(
+                lane_points[:, 0],
+                lane_points[:, 1],
+                color='lightgray',
+                alpha=1.0,
+                linewidth=linewidth,
+                linestyle='-',
+                zorder=zorder - 1,
+            )
             ax.scatter(
                 lane_points[:, 0],
                 lane_points[:, 1],
@@ -564,14 +582,34 @@ class LightningTrainer(pl.LightningModule):
                 alpha=0.9,
                 zorder=zorder,
             )
-
+            ax.scatter(
+                polygon_center[lane_idx, 0],
+                polygon_center[lane_idx, 1],
+                s=24,
+                color='blue',
+                alpha=0.8,
+                zorder=5
+            )
+            ax.scatter(
+                polygon_position[lane_idx, 0],
+                polygon_position[lane_idx, 1],
+                s=24,
+                marker='+',
+                color='lime',
+                alpha=1.0,
+                zorder=5
+            )
         for agent_idx in range(agent_position.shape[0]):
             valid_steps = agent_valid_mask[agent_idx].bool()
             if not valid_steps.any():
                 continue
             traj = agent_position[agent_idx, valid_steps]
+
             color = "tab:red" if agent_idx == 0 else "tab:blue"
-            zorder = 10 if agent_idx == 0 else 5
+            zorder = 10 if agent_idx == 0 else 3
+            marker = 'D' if agent_idx == 0 else 'o'
+            s = 30 if agent_idx == 0 else 24
+
             ax.scatter(
                 traj[:, 0], traj[:, 1], color=color, s=12, alpha=0.9, zorder=zorder
             )
@@ -579,8 +617,9 @@ class LightningTrainer(pl.LightningModule):
                 traj[-1, 0],
                 traj[-1, 1],
                 color=color,
-                s=24,
-                edgecolors="black",
+                marker=marker,
+                s=s,
+                edgecolors='black',
                 zorder=zorder,
             )
 
@@ -604,7 +643,9 @@ class LightningTrainer(pl.LightningModule):
         map_point_mask: torch.Tensor,
         route_gt: torch.Tensor,
         route_mask: torch.Tensor,
-        title: str,
+        polygon_center: torch.Tensor=None,
+        polygon_position: torch.Tensor=None,
+        title: str='',
     ) -> None:
         for lane_idx in range(map_point_position.shape[0]):
             visible_points = map_valid_mask[lane_idx].bool()
@@ -612,15 +653,61 @@ class LightningTrainer(pl.LightningModule):
 
             if visible_points.any():
                 lane_points = map_point_position[lane_idx, visible_points]
-                color = "tab:orange" if polygon_on_route[lane_idx] > 0 else "lightgray"
+                color = "tab:orange" if polygon_on_route[lane_idx] == 1 else "lightgray"
+                linewidth = 2.5 if polygon_on_route[lane_idx] == 1 else 1.0
+                zorder = 2 if polygon_on_route[lane_idx] == 1 else 1
+                # ax.plot(
+                #     lane_points[:, 0],
+                #     lane_points[:, 1],
+                #     color='lightgray',
+                #     alpha=1.0,
+                #     linewidth=linewidth,
+                #     linestyle='-',
+                #     zorder=zorder - 1,
+                # )
                 ax.scatter(
                     lane_points[:, 0], lane_points[:, 1], color=color, s=8, alpha=0.9
+                )
+                if not masked_points.any():
+                    ax.text(
+                        polygon_center[lane_idx, 0] + 0.8,
+                        polygon_center[lane_idx, 1] + 0.8,
+                        "F",
+                        color="blue",
+                        fontsize=9,
+                        clip_on=True,
+                        fontweight="bold",
+                    )
+            ax.scatter(
+                polygon_center[lane_idx, 0],
+                polygon_center[lane_idx, 1],
+                s=24,
+                color='blue',
+                alpha=0.8
+            )
+            ax.scatter(
+                polygon_position[lane_idx, 0],
+                polygon_position[lane_idx, 1],
+                s=24,
+                marker='+',
+                color='lime',
+                alpha=1.0
+            )
+            if route_mask[lane_idx]:
+                ax.text(
+                    polygon_center[lane_idx, 0] + 0.8,
+                    polygon_center[lane_idx, 1] - 1.2,
+                    "YR",
+                    color="red",
+                    fontsize=9,
+                    clip_on=True,
+                    fontweight="bold",
                 )
 
             if masked_points.any():
                 masked_lane_points = map_point_position_gt[lane_idx, masked_points]
-                masked_color = "gold" if route_gt[lane_idx] > 0 else "magenta"
-                marker = "x" if route_mask[lane_idx] else "o"
+                masked_color = "magenta"
+                marker = "x"
                 ax.scatter(
                     masked_lane_points[:, 0],
                     masked_lane_points[:, 1],
@@ -637,9 +724,13 @@ class LightningTrainer(pl.LightningModule):
             if visible_steps.any():
                 traj = agent_position[agent_idx, visible_steps]
                 color = "tab:red" if agent_idx == 0 else "tab:blue"
+                zorder = 10 if agent_idx == 0 else 5
+                marker = 'D' if agent_idx == 0 else 'o'
+                s = 30 if agent_idx == 0 else 24
                 ax.scatter(traj[:, 0], traj[:, 1], color=color, s=12, alpha=0.9)
                 ax.scatter(
-                    traj[-1, 0], traj[-1, 1], color=color, s=24, edgecolors="black"
+                    traj[-1, 0], traj[-1, 1], color=color, s=s, edgecolors="black",
+                    marker=marker
                 )
                 if not masked_steps.any():
                     ax.text(

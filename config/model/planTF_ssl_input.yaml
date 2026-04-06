@@ -29,8 +29,8 @@ feature_builder:
   future_horizon: 8
   sample_interval: 0.1
   max_agents: 32
-  agent_history_mask_ratio: 0.3
-  map_mask_ratio: 0.3
+  agent_history_mask_ratio: 0.5
+  map_mask_ratio: 0.5
   route_mask_ratio: 0.3
   mask_ego_history: true
   min_agent_history: 10

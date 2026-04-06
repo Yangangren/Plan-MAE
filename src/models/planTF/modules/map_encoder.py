@@ -9,6 +9,7 @@ class MapEncoder(nn.Module):
         self,
         polygon_channel=6,
         dim=128,
+        pretrain_ssl=False
     ) -> None:
         super().__init__()
 
@@ -19,7 +20,10 @@ class MapEncoder(nn.Module):
         )
 
         self.type_emb = nn.Embedding(3, dim)
-        self.on_route_emb = nn.Embedding(2, dim)
+        if pretrain_ssl:
+            self.on_route_emb = nn.Embedding(3, dim)
+        else:
+            self.on_route_emb = nn.Embedding(2, dim)
         self.traffic_light_emb = nn.Embedding(4, dim)
         self.unknown_speed_emb = nn.Embedding(1, dim)
 

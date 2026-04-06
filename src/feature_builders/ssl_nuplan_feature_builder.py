@@ -176,9 +176,26 @@ class SSLNuplanFeatureBuilder(NuplanFeatureBuilder):
         point_vector = map_data["point_vector"][:, 0]
         point_orientation = map_data["point_orientation"][:, 0]
         point_valid_mask = map_data["valid_mask"]
+        polygon_center = map_data["polygon_center"]
+
+        candidate_mask = point_valid_mask.copy()
+        if candidate_mask.shape[1] > 0:
+            in_x_range = (
+                (polygon_center[:, 0] >= -20)
+                & (polygon_center[:, 0] <= 120)
+            )
+            in_y_range = (polygon_center[:, 1] >= -40.0) & (
+                polygon_center[:, 1] <= 40.0
+            )
+            step_valid = point_valid_mask[:, 1:] & point_valid_mask[:, :-1]
+            deltas = point_position[:, 1:] - point_position[:, :-1]
+            step_lengths = np.hypot(deltas[..., 0], deltas[..., 1]) * step_valid
+            effective_length = step_lengths.sum(axis=-1)
+            candidate_rows = in_x_range & in_y_range & (effective_length >= 20.0)
+            candidate_mask &= candidate_rows[:, None]
 
         point_mask = self._sample_segment_masks(
-            point_valid_mask.copy(),
+            candidate_mask,
             ratio=self.map_mask_ratio,
             min_valid_points=self.min_map_points,
         )
@@ -207,18 +224,45 @@ class SSLNuplanFeatureBuilder(NuplanFeatureBuilder):
     def _mask_route_flags(
         self, map_data: Dict[str, np.ndarray]
     ) -> Dict[str, np.ndarray]:
+        ROUTE_OFF = 0
+        ROUTE_ON = 1
+        ROUTE_MASK = 2
+
         valid_polygons = map_data["valid_mask"].any(axis=-1)
+        route_gt = map_data["polygon_on_route"].astype(np.int64).copy()
+
         route_mask = np.zeros_like(valid_polygons, dtype=bool)
+        route_input = route_gt.copy()
 
-        candidate_indices = np.flatnonzero(valid_polygons)
-        if self.route_mask_ratio > 0 and len(candidate_indices) > 0:
-            num_mask = int(np.floor(len(candidate_indices) * self.route_mask_ratio))
-            num_mask = min(len(candidate_indices), max(1, num_mask))
-            selected = np.random.choice(candidate_indices, size=num_mask, replace=False)
-            route_mask[selected] = True
+        pos_candidates = np.flatnonzero(valid_polygons & (route_gt == ROUTE_ON))
+        neg_candidates = np.flatnonzero(valid_polygons & (route_gt == ROUTE_OFF))
 
-        route_gt = map_data["polygon_on_route"].copy()
-        map_data["polygon_on_route"][route_mask] = False
+        if (
+            self.route_mask_ratio > 0
+            and len(pos_candidates) > 0
+            and len(neg_candidates) > 0
+        ):
+            # sample for on-route lanes
+            num_pos_mask = int(np.floor(len(pos_candidates) * self.route_mask_ratio))
+            num_pos_mask = min(len(pos_candidates), max(1, num_pos_mask))
+
+            # sample for off-route lanes
+            num_neg_mask = min(len(neg_candidates), num_pos_mask)
+
+            pos_selected = np.random.choice(
+                pos_candidates, size=num_pos_mask, replace=False
+            )
+            neg_selected = np.random.choice(
+                neg_candidates, size=num_neg_mask, replace=False
+            )
+
+            route_mask[pos_selected] = True
+            route_mask[neg_selected] = True
+
+            # mark the masked position using a distinct flag
+            route_input[route_mask] = ROUTE_MASK
+
+        map_data["polygon_on_route"] = route_input
 
         return {
             "route_mask": route_mask,
@@ -237,6 +281,8 @@ class SSLNuplanFeatureBuilder(NuplanFeatureBuilder):
             "raw_map_point_position": data["map"]["point_position"][:, 0].copy(),
             "raw_map_valid_mask": data["map"]["valid_mask"].copy(),
             "raw_polygon_on_route": data["map"]["polygon_on_route"].copy(),
+            "raw_polygon_position": data["map"]["polygon_position"].copy(),
+            "raw_polygon_center": data["map"]["polygon_center"].copy(),
         }
 
     @staticmethod
