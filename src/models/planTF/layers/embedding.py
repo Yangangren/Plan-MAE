@@ -1,8 +1,39 @@
+import inspect
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from natten import NeighborhoodAttention1D
 from timm.models.layers import DropPath
+
+
+def _make_neighborhood_attention_1d(dim, attn_drop=0.0, **kwargs):
+    """Build NATten 1D attention across older and newer constructor signatures."""
+    kwargs["attn_drop"] = attn_drop
+    if kwargs.get("dilation") is None:
+        kwargs["dilation"] = 1
+
+    try:
+        parameters = inspect.signature(NeighborhoodAttention1D.__init__).parameters
+    except (TypeError, ValueError):
+        return NeighborhoodAttention1D(dim, **kwargs)
+
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_kwargs:
+        return NeighborhoodAttention1D(dim, **kwargs)
+
+    if "attn_drop" not in parameters and attn_drop != 0.0:
+        raise TypeError(
+            "The installed natten NeighborhoodAttention1D does not support "
+            "`attn_drop`; set the attention dropout to 0.0 or install an older "
+            "natten version compatible with this project."
+        )
+
+    kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return NeighborhoodAttention1D(dim, **kwargs)
 
 
 class NATSequenceEncoder(nn.Module):
@@ -166,7 +197,7 @@ class NATLayer(nn.Module):
         self.mlp_ratio = mlp_ratio
 
         self.norm1 = norm_layer(dim)
-        self.attn = NeighborhoodAttention1D(
+        self.attn = _make_neighborhood_attention_1d(
             dim,
             kernel_size=kernel_size,
             dilation=dilation,

@@ -26,6 +26,18 @@ from src.feature_builders.common.utils import rotate_round_z_axis
 from .planner_utils import global_trajectory_to_states, load_checkpoint
 
 
+def _filter_obsolete_natten_rpb(
+    checkpoint_state_dict,
+    model_state_dict,
+):
+    """Drop NATten 0.14 relative-position-bias keys removed in newer NATten."""
+    return {
+        key: value
+        for key, value in checkpoint_state_dict.items()
+        if key in model_state_dict or not key.endswith(".attn.rpb")
+    }
+
+
 class ImitationPlanner(AbstractPlanner):
     """
     Long-term IL-based trajectory planner, with short-term RL-based trajectory tracker.
@@ -71,7 +83,11 @@ class ImitationPlanner(AbstractPlanner):
         torch.set_grad_enabled(False)
 
         if self._planner_ckpt is not None:
-            self._planner.load_state_dict(load_checkpoint(self._planner_ckpt))
+            state_dict = load_checkpoint(self._planner_ckpt)
+            state_dict = _filter_obsolete_natten_rpb(
+                state_dict, self._planner.state_dict()
+            )
+            self._planner.load_state_dict(state_dict)
 
         self._planner.eval()
         self._planner = self._planner.to(self.device)
