@@ -89,14 +89,15 @@ class PlanningModel(TorchModuleWrapper):
             out_channels=4,
         )
         self.agent_predictor = build_mlp(dim, [dim * 2, future_steps * 2], norm="ln")
-        self.agent_ssl_decoder = build_mlp(
-            dim, [dim * 2, history_steps * 2], norm="ln"
-        )
-        self.ego_ssl_decoder = build_mlp(dim, [dim * 2, history_steps * 2], norm="ln")
-        self.map_ssl_decoder = build_mlp(
-            dim, [dim * 2, map_point_steps * 2], norm="ln"
-        )
-        self.route_ssl_decoder = build_mlp(dim, [dim, 1], norm="ln")
+        if self.pretrain_ssl:
+            self.agent_ssl_decoder = build_mlp(
+                dim, [dim * 2, history_steps * 2], norm="ln"
+            )
+            self.ego_ssl_decoder = build_mlp(dim, [dim * 2, history_steps * 2], norm="ln")
+            self.map_ssl_decoder = build_mlp(
+                dim, [dim * 2, map_point_steps * 2], norm="ln"
+            )
+            self.route_ssl_decoder = build_mlp(dim, [dim, 1], norm="ln")
 
         self.apply(self._init_weights)
 
