@@ -11,3 +11,8 @@ defaults:
   - override /scenario_filter: training_scenarios_1M
   - override /custom_trainer: planTF
   - override /lightning: custom_lightning
+
+lightning:
+  trainer:
+    params:
+      strategy: ddp_find_unused_parameters_true

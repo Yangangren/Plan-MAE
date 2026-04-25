@@ -56,7 +56,14 @@ def main(cfg: DictConfig) -> Optional[TrainingEngine]:
             cfg.output_dir, cfg.enable_profiling, "build_training_engine"
         ):
             engine = build_training_engine(cfg, worker)
-
+        if cfg.pretrained_checkpoint:
+                    ckpt = torch.load(cfg.pretrained_checkpoint, map_location="cpu")
+                    state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+                    key = 'model.map_encoder.on_route_emb.weight'
+                    if key in state_dict:
+                        # 从 [3, 128] 截取为 [2, 128]
+                        state_dict[key] = state_dict[key][:2, :]
+                    engine.model.load_state_dict(state_dict, strict=False)
         # Run training
         logger.info("Starting training...")
         with ProfilerContextManager(cfg.output_dir, cfg.enable_profiling, "training"):
